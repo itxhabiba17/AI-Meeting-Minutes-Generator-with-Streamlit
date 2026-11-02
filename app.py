@@ -21,7 +21,9 @@ from groq import (
     APIConnectionError,
     APIStatusError,
     AuthenticationError,
+    BadRequestError,
     Groq,
+    NotFoundError,
     RateLimitError,
 )
 from pypdf import PdfReader
@@ -42,8 +44,17 @@ from pypdf import PdfReader
 #  Option 3: paste the key into the sidebar box while the app is running.
 # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 
-LLM_MODEL = "llama-3.3-70b-versatile"      # Groq LLM used for the minutes
-STT_MODEL = "whisper-large-v3-turbo"       # Groq speech-to-text model
+# Groq changes its model list often, so the app asks Groq which models your key can
+# use and lets you choose in the sidebar. These lists are only the PREFERRED order
+# (the first one that is available gets selected by default). Edit them if you like.
+PREFERRED_LLMS = [
+    "llama-3.3-70b-versatile",
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "llama-3.1-8b-instant",
+]
+PREFERRED_STT = ["whisper-large-v3-turbo", "whisper-large-v3"]
 MAX_AUDIO_MB = 25                          # Groq audio upload limit (free tier)
 MAX_TEXT_CHARS = 30000                     # Keeps the request within model limits
 NOT_SPECIFIED = "Not specified"
@@ -85,6 +96,28 @@ def get_api_key(sidebar_key: str) -> str:
     if env_key:
         return env_key
     return sidebar_key.strip()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_available_models(key: str) -> list:
+    """Ask Groq which model IDs this API key can use."""
+    return sorted(m.id for m in Groq(api_key=key).models.list().data)
+
+
+def split_models(model_ids: list):
+    """Separate chat (LLM) models from speech-to-text models."""
+    skip = ("whisper", "tts", "guard", "orpheus", "playai", "embed", "safeguard", "compound")
+    chat = [m for m in model_ids if not any(w in m.lower() for w in skip)]
+    stt = [m for m in model_ids if "whisper" in m.lower()]
+    return chat, stt
+
+
+def default_index(options: list, preferred: list) -> int:
+    """Index of the first preferred model that is available (else 0)."""
+    for name in preferred:
+        if name in options:
+            return options.index(name)
+    return 0
 
 
 def read_text_file(uploaded_file) -> str:
@@ -138,7 +171,7 @@ def extract_notes_text(uploaded_file) -> str:
     return text.strip()
 
 
-def transcribe_audio(client: Groq, audio_file) -> str:
+def transcribe_audio(client: Groq, audio_file, stt_model: str) -> str:
     """Convert an audio recording to text using Groq Whisper."""
     data = audio_file.getvalue()
     if len(data) == 0:
@@ -150,7 +183,7 @@ def transcribe_audio(client: Groq, audio_file) -> str:
         )
     result = client.audio.transcriptions.create(
         file=(audio_file.name, data),
-        model=STT_MODEL,
+        model=stt_model,
         response_format="json",
     )
     text = getattr(result, "text", None) or (result if isinstance(result, str) else "")
@@ -245,17 +278,21 @@ def normalize_minutes(data: dict) -> dict:
     }
 
 
-def generate_minutes(client: Groq, meeting_text: str) -> dict:
+def generate_minutes(client: Groq, meeting_text: str, llm_model: str) -> dict:
     """Send the meeting text to the Groq LLM and return structured minutes."""
-    response = client.chat.completions.create(
-        model=LLM_MODEL,
+    request = dict(
+        model=llm_model,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"MEETING CONTENT:\n\n{meeting_text}"},
         ],
         temperature=0.1,  # low = more factual, less creative
-        response_format={"type": "json_object"},
     )
+    try:
+        response = client.chat.completions.create(**request, response_format={"type": "json_object"})
+    except BadRequestError:
+        # Some models don't support JSON mode - retry without it (we parse the text ourselves)
+        response = client.chat.completions.create(**request)
     return normalize_minutes(parse_json_response(response.choices[0].message.content))
 
 
@@ -315,8 +352,6 @@ with st.sidebar:
         placeholder="Paste key here if not using secrets / env",
         help="The app first checks Streamlit secrets and the GROQ_API_KEY environment variable.",
     )
-    st.caption(f"**LLM:** `{LLM_MODEL}`")
-    st.caption(f"**Speech-to-text:** `{STT_MODEL}`")
     st.divider()
     st.markdown(
         "**How it works**\n"
@@ -327,6 +362,24 @@ with st.sidebar:
     )
 
 api_key = get_api_key(sidebar_key)
+
+# Ask Groq which models are available for this key (cached for 10 minutes)
+available_chat, available_stt = [], []
+if api_key:
+    try:
+        available_chat, available_stt = split_models(fetch_available_models(api_key))
+    except AuthenticationError:
+        st.sidebar.error("Invalid Groq API key.")
+    except Exception as e:
+        st.sidebar.warning(f"Could not load the model list ({e}). Using defaults.")
+
+llm_options = available_chat or PREFERRED_LLMS
+stt_options = available_stt or PREFERRED_STT
+
+with st.sidebar:
+    llm_model = st.selectbox("LLM model", llm_options, index=default_index(llm_options, PREFERRED_LLMS),
+                             help="If you get a 'model not found' error, pick another model here.")
+    stt_model = st.selectbox("Speech-to-text model", stt_options, index=default_index(stt_options, PREFERRED_STT))
 
 # =============================================================================
 # HEADER
@@ -400,7 +453,7 @@ if generate_clicked:
             for f in audio_files or []:
                 with st.spinner(f"Transcribing {f.name} (this may take a moment)..."):
                     try:
-                        t = transcribe_audio(client, f)
+                        t = transcribe_audio(client, f, stt_model)
                         transcript_parts.append(f"[Transcript of {f.name}]\n{t}")
                         text_parts.append(f"[Transcript of {f.name}]\n{t}")
                     except AuthenticationError:
@@ -423,7 +476,7 @@ if generate_clicked:
                     combined = combined[:MAX_TEXT_CHARS]
 
                 with st.spinner("AI is writing the meeting minutes..."):
-                    minutes = generate_minutes(client, combined)
+                    minutes = generate_minutes(client, combined, llm_model)
 
                 st.session_state.minutes = minutes
                 st.session_state.transcript = "\n\n".join(transcript_parts)
@@ -432,6 +485,11 @@ if generate_clicked:
 
         except AuthenticationError:
             st.error("❌ Invalid Groq API key. Please check your key and try again.")
+        except NotFoundError:
+            st.error(
+                f"❌ The model '{llm_model}' is not available for your account. "
+                "Choose a different model in the sidebar and try again."
+            )
         except RateLimitError:
             st.error("⏳ Groq rate limit reached. Please wait a minute and try again.")
         except APIConnectionError:
